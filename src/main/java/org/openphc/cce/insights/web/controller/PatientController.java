@@ -5,11 +5,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.openphc.cce.insights.domain.entity.Deviation;
+import org.openphc.cce.insights.domain.entity.IntelligenceAlert;
 import org.openphc.cce.insights.domain.entity.MatcherEventLog;
 import org.openphc.cce.insights.domain.entity.ProtocolDefinition;
 import org.openphc.cce.insights.domain.entity.ProtocolInstance;
 import org.openphc.cce.insights.domain.entity.StepInstance;
 import org.openphc.cce.insights.domain.repository.DeviationRepository;
+import org.openphc.cce.insights.domain.repository.IntelligenceDeliveryRepository;
 import org.openphc.cce.insights.domain.repository.MatcherEventLogRepository;
 import org.openphc.cce.insights.domain.repository.ProtocolDefinitionRepository;
 import org.openphc.cce.insights.domain.repository.ProtocolInstanceRepository;
@@ -36,6 +38,7 @@ public class PatientController {
     private final DeviationRepository deviationRepository;
     private final MatcherEventLogRepository matcherEventLogRepository;
     private final ProtocolDefinitionRepository protocolDefinitionRepository;
+    private final IntelligenceDeliveryRepository intelligenceDeliveryRepository;
     private final ObjectMapper objectMapper;
 
     @GetMapping("/{patientId}/compliance-timeline")
@@ -300,6 +303,94 @@ public class PatientController {
                         Comparator.reverseOrder()))
                 .collect(Collectors.toList());
         return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /**
+     * What intelligence sent for this patient: one entry per delivery (an action can go to several
+     * destinations), with the step it belongs to, the intelligence action that fired and why, and
+     * whether it arrived. Not date-filtered, like the journey it sits next to.
+     */
+    @GetMapping("/{patientId}/intelligence-alerts")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getPatientIntelligenceAlerts(
+            @PathVariable String patientId) {
+        List<ProtocolInstance> instances = protocolInstanceRepository.findByPatientId(patientId);
+        Map<UUID, ProtocolInstance> byId = instances.stream()
+                .collect(Collectors.toMap(ProtocolInstance::getId, pi -> pi, (a, b) -> a));
+
+        // Step and intelligence-action titles per protocol definition, nested actions included (1 query
+        // each). Kept apart because two protocols can use the same action id with different titles.
+        Map<UUID, Map<String, String>> titlesByDefinition = new HashMap<>();
+        instances.stream()
+                .map(ProtocolInstance::getProtocolDefinitionId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .forEach(pdId -> resolveActionTitles(pdId, titlesByDefinition.computeIfAbsent(pdId, k -> new HashMap<>())));
+
+        List<Map<String, Object>> result = intelligenceDeliveryRepository
+                .findAlertsByProtocolInstanceIdIn(new ArrayList<>(byId.keySet()))
+                .stream()
+                .map(a -> {
+                    ProtocolInstance pi = byId.get(a.getProtocolInstanceId());
+                    Map<String, String> titles = pi != null && pi.getProtocolDefinitionId() != null
+                            ? titlesByDefinition.getOrDefault(pi.getProtocolDefinitionId(), Map.of())
+                            : Map.of();
+                    return toAlertMap(a, pi, titles);
+                })
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    private Map<String, Object> toAlertMap(IntelligenceAlert a, ProtocolInstance pi, Map<String, String> titles) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("deliveryId", a.getDeliveryId());
+        map.put("intelligenceEventId", a.getIntelligenceEventId());
+        map.put("protocolInstanceId", a.getProtocolInstanceId());
+        map.put("protocolCanonical", pi != null ? pi.getProtocolCanonical() : null);
+        map.put("stepInstanceId", a.getStepInstanceId());
+        map.put("actionId", a.getActionId());
+        map.put("stepName", a.getActionId() != null
+                ? titles.getOrDefault(a.getActionId(), formatActionId(a.getActionId())) : null);
+        map.put("alertActionId", a.getAlertActionId());
+        map.put("alertTitle", a.getAlertActionId() != null
+                ? titles.getOrDefault(a.getAlertActionId(), formatActionId(a.getAlertActionId())) : null);
+        map.put("triggerReason", a.getTriggerReason());
+        map.put("slaStatus", blankToNull(a.getSlaStatus()));
+        map.put("destination", a.getDestination());
+        map.put("resourceType", a.getActionType());
+        map.put("severity", blankToNull(a.getSeverity()));
+        map.put("status", a.getStatus());
+        map.put("attemptCount", a.getAttemptCount());
+        map.put("httpStatusCode", a.getHttpStatusCode());
+        map.put("errorMessage", blankToNull(a.getErrorMessage()));
+        map.put("createdAt", a.getCreatedAt());
+        map.put("deliveredAt", a.getDeliveredAt());
+        return map;
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s;
+    }
+
+    /** Like {@link #resolveStepTitles}, but walks nested actions too (sub-steps, intelligence actions). */
+    private void resolveActionTitles(UUID protocolDefinitionId, Map<String, String> titles) {
+        try {
+            ProtocolDefinition pd = protocolDefinitionRepository.findById(protocolDefinitionId).orElse(null);
+            if (pd != null && pd.getDefinition() != null) {
+                collectActionTitles(objectMapper.readTree(pd.getDefinition()).get("action"), titles);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to parse protocol definition {}: {}", protocolDefinitionId, e.getMessage());
+        }
+    }
+
+    private void collectActionTitles(JsonNode actions, Map<String, String> titles) {
+        if (actions == null || !actions.isArray()) return;
+        for (JsonNode action : actions) {
+            if (action.hasNonNull("id") && action.hasNonNull("title")) {
+                titles.putIfAbsent(action.get("id").asText(), action.get("title").asText());
+            }
+            collectActionTitles(action.get("action"), titles);
+        }
     }
 
     private void resolveStepTitles(UUID protocolDefinitionId, Map<String, String> titles) {

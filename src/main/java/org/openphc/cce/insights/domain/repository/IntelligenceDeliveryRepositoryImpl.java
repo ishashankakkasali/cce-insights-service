@@ -2,15 +2,19 @@ package org.openphc.cce.insights.domain.repository;
 
 import org.jooq.DSLContext;
 import org.jooq.Record;
+import org.jooq.SelectFieldOrAsterisk;
 import org.jooq.impl.DSL;
+import org.openphc.cce.insights.domain.entity.IntelligenceAlert;
 import org.openphc.cce.insights.domain.entity.IntelligenceDelivery;
 import org.springframework.stereotype.Repository;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
 import static org.openphc.cce.insights.jooq.Tables.INTELLIGENCE_DELIVERIES;
+import static org.openphc.cce.insights.jooq.Tables.INTELLIGENCE_EVENT_LOGS;
 
 @Repository
 public class IntelligenceDeliveryRepositoryImpl
@@ -255,5 +259,72 @@ public class IntelligenceDeliveryRepositoryImpl
                   .orderBy(DSL.field("cnt").desc())
                   .fetch()
                   .map(r -> new Object[]{r.get(0, String.class), r.get(1, Long.class)});
+    }
+
+    /**
+     * intelligence_deliveries joined to intelligence_event_logs on the delivery's event, restricted to
+     * the given protocol instances. The event log carries the protocol instance, the intelligence
+     * action that fired and the trigger reason; deliveries carry neither. FINAL (when enabled) applies
+     * to both sides, so a delivery's latest status is read.
+     */
+    @Override
+    public List<IntelligenceAlert> findAlertsByProtocolInstanceIdIn(List<UUID> protocolInstanceIds) {
+        if (protocolInstanceIds == null || protocolInstanceIds.isEmpty()) return List.of();
+        List<String> ids = protocolInstanceIds.stream().map(UUID::toString).toList();
+        String e = INTELLIGENCE_EVENT_LOGS.getName();
+        var events = DSL.table(DSL.sql(
+                "(SELECT " + INTELLIGENCE_EVENT_LOGS.ID.getName() + " AS event_id, "
+                + INTELLIGENCE_EVENT_LOGS.PROTOCOL_INSTANCE_ID.getName() + ", "
+                + INTELLIGENCE_EVENT_LOGS.STEP_INSTANCE_ID.getName() + ", "
+                + INTELLIGENCE_EVENT_LOGS.STEP_ACTION_ID.getName() + ", "
+                + INTELLIGENCE_EVENT_LOGS.TRIGGER_REASON.getName() + ", "
+                + INTELLIGENCE_EVENT_LOGS.SLA_STATUS.getName()
+                + " FROM " + e + finalClause()
+                + " WHERE " + INTELLIGENCE_EVENT_LOGS.PROTOCOL_INSTANCE_ID.getName() + " IN ({0})) ev",
+                DSL.list(ids.stream().map(DSL::val).toList())));
+        // Explicit columns: http_status_code and error_message are MATERIALIZED, which SELECT * leaves out.
+        List<SelectFieldOrAsterisk> columns = new ArrayList<>();
+        for (var f : List.of(INTELLIGENCE_DELIVERIES.ID, INTELLIGENCE_DELIVERIES.INTELLIGENCE_EVENT_ID,
+                INTELLIGENCE_DELIVERIES.ACTION_ID, INTELLIGENCE_DELIVERIES.DESTINATION,
+                INTELLIGENCE_DELIVERIES.ACTION_TYPE, INTELLIGENCE_DELIVERIES.SEVERITY,
+                INTELLIGENCE_DELIVERIES.STATUS, INTELLIGENCE_DELIVERIES.ATTEMPT_COUNT,
+                INTELLIGENCE_DELIVERIES.HTTP_STATUS_CODE, INTELLIGENCE_DELIVERIES.ERROR_MESSAGE,
+                INTELLIGENCE_DELIVERIES.CREATED_AT, INTELLIGENCE_DELIVERIES.DELIVERED_AT)) {
+            columns.add(DSL.field(DSL.name("d", f.getName())).as(f.getName()));
+        }
+        for (var f : List.of(INTELLIGENCE_EVENT_LOGS.PROTOCOL_INSTANCE_ID, INTELLIGENCE_EVENT_LOGS.STEP_INSTANCE_ID,
+                INTELLIGENCE_EVENT_LOGS.STEP_ACTION_ID, INTELLIGENCE_EVENT_LOGS.TRIGGER_REASON,
+                INTELLIGENCE_EVENT_LOGS.SLA_STATUS)) {
+            columns.add(DSL.field(DSL.name("ev", f.getName())).as(f.getName()));
+        }
+        return dsl.select(columns)
+                  .from(DSL.table(DSL.sql(INTELLIGENCE_DELIVERIES.getName() + " d" + finalClause())))
+                  .join(events)
+                  .on(DSL.condition("ev.event_id = d." + INTELLIGENCE_DELIVERIES.INTELLIGENCE_EVENT_ID.getName()))
+                  .orderBy(DSL.field("d." + INTELLIGENCE_DELIVERIES.CREATED_AT.getName()).desc())
+                  .fetch()
+                  .map(this::toAlert);
+    }
+
+    private IntelligenceAlert toAlert(Record r) {
+        return IntelligenceAlert.builder()
+                .deliveryId(parseUUID(r.get(INTELLIGENCE_DELIVERIES.ID.getName(), String.class)))
+                .intelligenceEventId(parseUUID(r.get(INTELLIGENCE_DELIVERIES.INTELLIGENCE_EVENT_ID.getName(), String.class)))
+                .protocolInstanceId(parseUUID(r.get(INTELLIGENCE_EVENT_LOGS.PROTOCOL_INSTANCE_ID.getName(), String.class)))
+                .stepInstanceId(parseUUID(r.get(INTELLIGENCE_EVENT_LOGS.STEP_INSTANCE_ID.getName(), String.class)))
+                .actionId(r.get(INTELLIGENCE_DELIVERIES.ACTION_ID.getName(), String.class))
+                .alertActionId(r.get(INTELLIGENCE_EVENT_LOGS.STEP_ACTION_ID.getName(), String.class))
+                .triggerReason(r.get(INTELLIGENCE_EVENT_LOGS.TRIGGER_REASON.getName(), String.class))
+                .slaStatus(r.get(INTELLIGENCE_EVENT_LOGS.SLA_STATUS.getName(), String.class))
+                .destination(r.get(INTELLIGENCE_DELIVERIES.DESTINATION.getName(), String.class))
+                .actionType(r.get(INTELLIGENCE_DELIVERIES.ACTION_TYPE.getName(), String.class))
+                .severity(r.get(INTELLIGENCE_DELIVERIES.SEVERITY.getName(), String.class))
+                .status(r.get(INTELLIGENCE_DELIVERIES.STATUS.getName(), String.class))
+                .attemptCount(r.get(INTELLIGENCE_DELIVERIES.ATTEMPT_COUNT.getName(), Integer.class))
+                .httpStatusCode(r.get(INTELLIGENCE_DELIVERIES.HTTP_STATUS_CODE.getName(), Integer.class))
+                .errorMessage(r.get(INTELLIGENCE_DELIVERIES.ERROR_MESSAGE.getName(), String.class))
+                .createdAt(recordDateTime(r, INTELLIGENCE_DELIVERIES.CREATED_AT.getName()))
+                .deliveredAt(recordDateTime(r, INTELLIGENCE_DELIVERIES.DELIVERED_AT.getName()))
+                .build();
     }
 }

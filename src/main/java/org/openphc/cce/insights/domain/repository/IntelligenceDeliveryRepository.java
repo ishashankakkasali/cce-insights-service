@@ -1,5 +1,6 @@
 package org.openphc.cce.insights.domain.repository;
 
+import org.openphc.cce.insights.domain.entity.IntelligenceAlert;
 import org.openphc.cce.insights.domain.entity.IntelligenceDelivery;
 
 import java.time.OffsetDateTime;
@@ -37,4 +38,7 @@ public interface IntelligenceDeliveryRepository extends ReadOnlyRepository<Intel
     List<Object[]> countBySeverityFiltered(OffsetDateTime startDate, OffsetDateTime endDate);
 
     List<Object[]> countByDestinationFiltered(OffsetDateTime startDate, OffsetDateTime endDate);
+
+    /** Deliveries whose intelligence event belongs to one of these protocol instances, newest first. */
+    List<IntelligenceAlert> findAlertsByProtocolInstanceIdIn(List<UUID> protocolInstanceIds);
 }
